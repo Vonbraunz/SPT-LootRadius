@@ -1,4 +1,4 @@
-﻿using SPT.Reflection.Patching;
+using SPT.Reflection.Patching;
 using EFT.Interactive;
 using EFT.UI;
 using EFT;
@@ -15,104 +15,141 @@ using EFT.UI.DragAndDrop;
 
 namespace DrakiaXYZ.LootRadius.Patches
 {
+    
+    /// Fires after ItemsPanel.Show — populates the virtual loot-radius grid with any
+    /// LootItems within range and injects it as the right-hand panel in the inventory UI.
+    
     public class LootPanelOpenPatch : ModulePatch
     {
-        private static FieldInfo _rightPaneField;
-        private static FieldInfo _simplePanelField;
-        private static FieldInfo _containedGridsViewField;
-        private static LayerMask _interactiveLayerMask = 1 << LayerMask.NameToLayer("Interactive");
+        // Reflects into ItemUiContext to register our virtual stash as a Ctrl+Click target.
+        private static FieldInfo   _rightPaneField;
+        // Reflects into SimpleStashPanel to access its internal SearchableItemView.
+        private static FieldInfo   _simplePanelField;
+        // Reflects into SearchableItemView to get the ContainedGridsView (and thus GridViews[]).
+        private static FieldInfo   _containedGridsViewField;
+
+        private static readonly LayerMask _interactiveLayerMask =
+            1 << LayerMask.NameToLayer("Interactive");
 
         private static StashItemClass _stash
         {
-            get { return LootRadiusPlugin.RadiusStash; }
-            set { LootRadiusPlugin.RadiusStash = value; }
+            get => LootRadiusPlugin.RadiusStash;
+            set => LootRadiusPlugin.RadiusStash = value;
         }
 
         protected override MethodBase GetTargetMethod()
         {
-            // Find the variable that stores the right hand grid in the ItemUiContext, so we can Ctrl+Click
-            _rightPaneField = AccessTools.GetDeclaredFields(typeof(ItemUiContext)).Single(x => x.FieldType == typeof(CompoundItem[]));
+            // CompoundItem[] field on ItemUiContext drives Ctrl+Click behaviour.
+            _rightPaneField = AccessTools
+                .GetDeclaredFields(typeof(ItemUiContext))
+                .Single(x => x.FieldType == typeof(CompoundItem[]));
 
-            // Used for removing an item from the GridView
-            _simplePanelField = AccessTools.Field(typeof(SimpleStashPanel), "_simplePanel");
-            _containedGridsViewField = AccessTools.Field(typeof(SearchableItemView), "containedGridsView_0");
+            _simplePanelField = AccessTools.Field(
+                typeof(SimpleStashPanel), "_simplePanel");
+
+            _containedGridsViewField = AccessTools.Field(
+                typeof(SearchableItemView), "containedGridsView_0");
 
             return typeof(ItemsPanel).GetMethod(nameof(ItemsPanel.Show));
         }
 
         [PatchPostfix]
         public static async void PatchPostfix(
-            ItemsPanel __instance,
-            Task __result,
+            ItemsPanel              __instance,
+            Task                    __result,
             ItemContextAbstractClass sourceContext,
-            CompoundItem lootItem,
-            InventoryController inventoryController,
-            ItemsPanel.EItemsTab currentTab,
-            SimpleStashPanel ____simpleStashPanel,
-            AddViewListClass ___UI
-        )
+            CompoundItem            lootItem,
+            InventoryController     inventoryController,
+            ItemsPanel.EItemsTab    currentTab,
+            SimpleStashPanel        ____simpleStashPanel,
+            AddViewListClass        ___UI)
         {
-            // Wait for original to finish
+            // Wait for the vanilla Show() to finish before we inject.
             await __result;
 
-            // If lootItem isn't null, don't do anything, it means there's a right hand panel already
+            // If there's already a right-hand loot panel (opening a container etc.)
+            // do nothing — we only activate when the bare player inventory opens.
             if (lootItem != null)
-            {
                 return;
-            }
 
-            LootRadiusStashGrid grid = _stash.Grids[0] as LootRadiusStashGrid;
-            Vector3 playerPosition = Singleton<GameWorld>.Instance.MainPlayer.Position;
+            var grid           = (LootRadiusStashGrid)_stash.Grids[0];
+            var playerPosition = Singleton<GameWorld>.Instance.MainPlayer.Position;
 
-            // First find any items directly near the player's feet, to allow them to loot things like items slightly under the floor
-            Collider[] floorItemColliders = Physics.OverlapSphere(playerPosition, 0.35f, _interactiveLayerMask);
-            AddAllowedItems(grid, floorItemColliders, true);
+            // 1. Items directly at feet (~0.35 m), ignoring line-of-sight.
+            //    Catches items slightly below the floor the player is standing on.
+            var floorColliders = Physics.OverlapSphere(
+                playerPosition, 0.35f, _interactiveLayerMask);
+            AddNearbyItems(grid, floorColliders, ignoreLineOfSight: true);
 
-            // Then collect items around the player body, based on the loot radius
-            playerPosition += (Vector3.up * 0.5f);
-            Collider[] nearbyItemColliders = Physics.OverlapSphere(playerPosition, Settings.LootRadius.Value, _interactiveLayerMask);
-            AddAllowedItems(grid, nearbyItemColliders, false);
+            // 2. Items in the configurable radius around the player's centre.
+            var bodyColliders = Physics.OverlapSphere(
+                playerPosition + Vector3.up * 0.5f,
+                Settings.LootRadius.Value,
+                _interactiveLayerMask);
+            AddNearbyItems(grid, bodyColliders, ignoreLineOfSight: false);
 
-            // Show the stash in the inventory panel
-            ____simpleStashPanel.Show(_stash, inventoryController, sourceContext.CreateChild(_stash), true, inventoryController, currentTab);
+            // SimpleStashPanel.Show signature in 4.0.13:
+            // Show(CompoundItem, InventoryController, ItemContextAbstractClass, bool inRaid,
+            //      SortingTableItemClass sortingTable, EStashSearchAvailability,
+            //      InventoryController leftSide = null, EItemsTab tab = Gear)
+            ____simpleStashPanel.Show(
+                _stash,
+                inventoryController,
+                sourceContext.CreateChild(_stash),
+                true,
+                null,
+                SimpleStashPanel.EStashSearchAvailability.Unavailable,
+                null,
+                currentTab);
+
             ___UI.AddDisposable<SimpleStashPanel>(____simpleStashPanel);
 
-            _rightPaneField.SetValue(ItemUiContext.Instance, new CompoundItem[] { _stash });
+            _rightPaneField.SetValue(
+                ItemUiContext.Instance, new CompoundItem[] { _stash });
 
-            var simplePanel = _simplePanelField.GetValue(____simpleStashPanel) as SearchableItemView;
+            // Cache the GridViews so OwnerRemoveItemEvent can update the UI live.
+            var simplePanel        = _simplePanelField.GetValue(____simpleStashPanel) as SearchableItemView;
             var containedGridsView = _containedGridsViewField.GetValue(simplePanel) as ContainedGridsView;
-            grid.GridViews = containedGridsView.GridViews;
+            grid.GridViews         = containedGridsView.GridViews;
         }
 
-        private static void AddAllowedItems(LootRadiusStashGrid grid, Collider[] colliders, bool ignoreLineOfSight)
+   
+        /// Iterates colliders, finds LootItem components, and adds eligible items to the grid.
+        /// Also wires up the RemoveItemEvent so the UI reacts when a looted item disappears.
+   
+        private static void AddNearbyItems(
+            LootRadiusStashGrid grid, Collider[] colliders, bool ignoreLineOfSight)
         {
-            foreach (Collider collider in colliders)
+            foreach (var collider in colliders)
             {
-                var item = collider.gameObject.GetComponentInParent<LootItem>();
-                if (item != null && item.Item.Parent.Container.ID != grid.ID && (ignoreLineOfSight || IsLineOfSight(item.transform.position)))
-                {
-                    item.ItemOwner.RemoveItemEvent += grid.OwnerRemoveItemEvent;
+                var lootItem = collider.gameObject.GetComponentInParent<LootItem>();
+                if (lootItem == null)
+                    continue;
 
-                    grid.AddInternal(item.Item, grid.FindFreeSpace(item.Item), false, true);
-                }
+                // Skip items already inside this grid or not in line of sight.
+                if (lootItem.Item.Parent.Container.ID == grid.ID)
+                    continue;
+
+                if (!ignoreLineOfSight && !IsLineOfSight(lootItem.transform.position))
+                    continue;
+
+                lootItem.ItemOwner.RemoveItemEvent += grid.OwnerRemoveItemEvent;
+                grid.AddInternal(lootItem.Item, grid.FindFreeSpace(lootItem.Item), false, true);
             }
         }
 
-        /**
-         * Return true if the end position is within line of sight of the player
-         */
+     
+        /// Returns true if there is an unobstructed line from the player's head
+        /// to <paramref name="endPos"/>.
+     
         private static bool IsLineOfSight(Vector3 endPos)
         {
-            // Start at the player's head
-            Vector3 startPos = Singleton<GameWorld>.Instance.MainPlayer.MainParts[BodyPartType.head].Position;
+            Vector3 headPos = Singleton<GameWorld>.Instance
+                .MainPlayer.MainParts[BodyPartType.head].Position;
 
-            // LineCast returns true if it hits a HighPolyCollider, indicating the item isn't within line of sight of the player's head
-            if (Physics.Linecast(startPos, endPos, LayerMaskClass.HighPolyWithTerrainMask))
-            {
-                return false;
-            }
-
-            return true;
+            // Linecast hits HighPolyColliders (solid world geometry).
+            // A hit means the item is obscured, so return false.
+            return !Physics.Linecast(headPos, endPos, LayerMaskClass.HighPolyWithTerrainMask);
         }
     }
 }
