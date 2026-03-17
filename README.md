@@ -1,5 +1,7 @@
 # SPT-LootRadius
 
+## Disclaimer - This Version has an item ghosting bug when moving items from the nearby grid to inventory - ive traced it all the way to the root cause of a structural issue in how the panel lifecycle interacts with the game's two-phase event system this is fundamentally unfixable through event plumbing, container ownership, or registration. The listener is destroyed before the completion event arrives. The only real fix would be patching ItemsPanel itself to not close during a move, which is a much bigger undertaking and out of my expertise, The ghost is cosmetic — items move correctly, the visual just lingers until reopen
+
 A port of [DrakiaXYZ's SPT-LootRadius](https://github.com/DrakiaXYZ/SPT-LootRadius) updated for **SPT 4.0.13**.
 
 When you open your inventory in-raid, a **"Nearby Items"** panel automatically appears on the right side showing all lootable items within a configurable radius around your player. Drag items directly from the panel into your inventory without having to walk up and individually interact with each one.
